@@ -44,6 +44,15 @@ var (
 	}
 
 	logStatsArgs cmd.LogStatsArgs
+
+	// verifyCmd (POC) verifies a pre-wrap conglomeration proof emitted by
+	// `prove --stop-before-wrap`, using Linea's native wizard verifier.
+	verifyCmd = &cobra.Command{
+		Use:   "verify",
+		Short: "verify a pre-wrap conglomeration proof (emitted by prove --stop-before-wrap)",
+		RunE:  cmdVerify,
+	}
+	verifyArgs cmd.VerifyArgs
 )
 
 func main() {
@@ -74,6 +83,12 @@ func init() {
 	proveCmd.Flags().StringVar(&proverArgs.Input, "in", "", "input file")
 	proveCmd.Flags().StringVar(&proverArgs.Output, "out", "", "output file")
 	proveCmd.Flags().BoolVar(&proverArgs.Large, "large", false, "run the large execution circuit")
+	// POC: stop before the BLS12-377 wrap and emit the pre-wrap conglomeration proof.
+	proveCmd.Flags().BoolVar(&proverArgs.StopBeforeWrap, "stop-before-wrap", false, "POC: emit the pre-wrap conglomeration proof and skip the BLS12-377 wrap")
+	proveCmd.Flags().StringVar(&proverArgs.PrewrapOut, "prewrap-out", "", "path for the emitted pre-wrap proof (default: <out>.wizproof)")
+
+	rootCmd.AddCommand(verifyCmd)
+	verifyCmd.Flags().StringVar(&verifyArgs.Proof, "proof", "", "path to the pre-wrap proof to verify")
 
 	rootCmd.AddCommand(logStatsCmd)
 	logStatsCmd.Flags().StringVar(&logStatsArgs.Input, "in", "", "input file")
@@ -88,6 +103,11 @@ func cmdSetup(_cmd *cobra.Command, _ []string) error {
 func cmdProve(*cobra.Command, []string) error {
 	proverArgs.ConfigFile = fConfigFile
 	return cmd.Prove(proverArgs)
+}
+
+func cmdVerify(*cobra.Command, []string) error {
+	verifyArgs.ConfigFile = fConfigFile
+	return cmd.Verify(verifyArgs)
 }
 
 func cmdLogStats(_cmd *cobra.Command, _ []string) error {

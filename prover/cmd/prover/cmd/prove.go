@@ -24,6 +24,12 @@ type ProverArgs struct {
 	Output     string
 	Large      bool
 	ConfigFile string
+	// StopBeforeWrap (POC) forces cfg.Execution.StopBeforeWrap on, so the
+	// prover emits the pre-wrap proof and skips the BLS wrap.
+	StopBeforeWrap bool
+	// PrewrapOut (POC) is the path for the emitted pre-wrap proof when
+	// stop-before-wrap is active. Empty ⇒ defaults to <Output>.wizproof.
+	PrewrapOut string
 }
 
 // Prove orchestrates the proving process based on the job type
@@ -72,6 +78,20 @@ func handleExecutionJob(cfg *config.Config, args ProverArgs) error {
 	req := &execution.Request{}
 	if err := readRequest(args.Input, req); err != nil {
 		return fmt.Errorf("could not read the input file (%v): %w", args.Input, err)
+	}
+
+	// POC: the CLI flag forces stop-before-wrap on (config may also set it). When
+	// active, choose where the emitted pre-wrap proof is written (defaults to
+	// <output>.wizproof). The path travels via cfg so the limitless.Prove(cfg, req)
+	// signature stays unchanged.
+	if args.StopBeforeWrap {
+		cfg.Execution.StopBeforeWrap = true
+	}
+	if cfg.Execution.StopBeforeWrap && cfg.Execution.PrewrapProofPath == "" {
+		cfg.Execution.PrewrapProofPath = args.PrewrapOut
+		if cfg.Execution.PrewrapProofPath == "" {
+			cfg.Execution.PrewrapProofPath = args.Output + ".wizproof"
+		}
 	}
 
 	var resp *execution.Response

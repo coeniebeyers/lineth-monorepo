@@ -97,6 +97,21 @@ func Prove(cfg *config.Config, req *execution.Request) (*execution.Response, err
 		return nil, fmt.Errorf("distributed pipeline failed: %w", err)
 	}
 
+	if cfg.Execution.StopBeforeWrap {
+		// POC: emit the pre-wrap conglomeration proof and skip the BLS12-377
+		// PLONK wrap. The wrap's ~191GB setup load (constraint system + proving
+		// key + BLS12-377 SRS) is gated off in RunDistributedPipeline, so this
+		// mode never pays that cost.
+		if err := emitPreWrapProof(cfg, pipeline.FinalProof.GetOuterProofInput()); err != nil {
+			return nil, fmt.Errorf("emit pre-wrap proof: %w", err)
+		}
+		// Release the conglomeration mmap buffer AFTER serialization: the proof's
+		// smartvectors may reference it during StoreToDisk.
+		pipeline.Cong = nil
+		pipeline.CongBuf.Release()
+		return &out, nil
+	}
+
 	setup := pipeline.Setup
 
 	out.Proof = execCirc.MakeProof(
@@ -115,6 +130,18 @@ func Prove(cfg *config.Config, req *execution.Request) (*execution.Response, err
 	out.VerifyingKeyShaSum = setup.VerifyingKeyDigest()
 
 	return &out, nil
+}
+
+// emitPreWrapProof serializes the pre-wrap conglomeration proof to disk
+// (uncompressed, so a later verify uses the zero-copy mmap path and a byte
+// tamper is caught by the cryptographic verifier rather than a checksum).
+func emitPreWrapProof(cfg *config.Config, proof wizard.Proof) error {
+	path := cfg.Execution.PrewrapProofPath
+	if path == "" {
+		return fmt.Errorf("stop-before-wrap: PrewrapProofPath is empty")
+	}
+	logrus.Infof("stop-before-wrap: emitting pre-wrap conglomeration proof to %s", path)
+	return serde.StoreToDisk(path, proof, false)
 }
 
 // RunDistributedPipeline runs the full limitless distributed proving pipeline:
@@ -281,11 +308,17 @@ func RunDistributedPipeline(cfg *config.Config, zkevmWitness *zkevm.Witness) (*P
 		err   error
 	}
 	setupCh := make(chan setupResult, 1)
-	go func() {
-		logrus.Infof("Loading setup (background) - circuitID: %s", circuits.ExecutionLimitlessCircuitID)
-		s, err := circuits.LoadSetup(cfg, circuits.ExecutionLimitlessCircuitID)
-		setupCh <- setupResult{setup: s, err: err}
-	}()
+	// In stop-before-wrap mode the outer wrap is skipped, so we must NOT load
+	// its setup (constraint system + proving key + BLS12-377 SRS) — that load is
+	// a large fraction of the ~191GB peak. Skipping it is what makes this mode fit
+	// on commodity RAM.
+	if !cfg.Execution.StopBeforeWrap {
+		go func() {
+			logrus.Infof("Loading setup (background) - circuitID: %s", circuits.ExecutionLimitlessCircuitID)
+			s, err := circuits.LoadSetup(cfg, circuits.ExecutionLimitlessCircuitID)
+			setupCh <- setupResult{setup: s, err: err}
+		}()
+	}
 
 	// -- 4. Compute shared randomness FIRST (while proofGLs is still valid)
 	sharedRandomness := distributed.GetSharedRandomnessFromSegmentProofs(proofGLs)
@@ -388,16 +421,20 @@ func RunDistributedPipeline(cfg *config.Config, zkevmWitness *zkevm.Witness) (*P
 
 	logrus.Infof("HIERARCHICAL CONGLOMERATION SUCCESSFUL!!!")
 
-	sr := <-setupCh
-	if sr.err != nil {
-		return nil, fmt.Errorf("could not load setup: %w", sr.err)
+	var setup circuits.Setup
+	if !cfg.Execution.StopBeforeWrap {
+		sr := <-setupCh
+		if sr.err != nil {
+			return nil, fmt.Errorf("could not load setup: %w", sr.err)
+		}
+		setup = sr.setup
 	}
 
 	return &PipelineResult{
 		FinalProof: res.proof,
 		Cong:       cong,
 		CongBuf:    res.congBuf,
-		Setup:      sr.setup,
+		Setup:      setup,
 	}, nil
 }
 

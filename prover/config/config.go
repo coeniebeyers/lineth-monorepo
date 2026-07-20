@@ -290,6 +290,18 @@ type Execution struct {
 	// serialized file on disk via memory-mapping, instead of compiling it
 	// at proving time. The file is produced during setup by protocol/serde.
 	Serialization bool `mapstructure:"serialization"`
+
+	// StopBeforeWrap (POC) makes the limitless prover stop before the final
+	// BLS12-377 PLONK "wrap" step: instead of wrapping, it emits the pre-wrap
+	// conglomeration proof (a wizard.Proof) to PrewrapProofPath and skips the
+	// wrap's setup load. This is for permissioned/validium deployments that
+	// verify the pre-wrap proof directly (off-chain / on their own L1) and do
+	// not need cheap on-Ethereum verification. Defaults to false (wrap runs).
+	StopBeforeWrap bool `mapstructure:"stop_before_wrap"`
+
+	// PrewrapProofPath is where the emitted pre-wrap proof is written when
+	// StopBeforeWrap is set. Set by the CLI layer (from --prewrap-out).
+	PrewrapProofPath string `mapstructure:"prewrap_proof_path"`
 }
 
 type DataAvailability struct {

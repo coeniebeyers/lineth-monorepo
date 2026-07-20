@@ -147,6 +147,7 @@ func init() {
 	RegisterImplementation(query.GrandProductParams{})
 	RegisterImplementation(query.InnerProductParams{})
 	RegisterImplementation(query.LogDerivSumParams{})
+	RegisterImplementation(query.HornerParams{}) // needed to serialize a wizard.Proof containing Horner-query params (e.g. the pre-wrap conglomeration proof)
 	RegisterImplementation(query.Poseidon2{})
 
 	// Symbolic

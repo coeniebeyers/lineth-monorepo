@@ -75,10 +75,15 @@ func ProveOnTheFly(cfg *config.Config, req *execution.Request) (*execution.Respo
 		errSetup    error
 		chSetupDone = make(chan struct{})
 	)
-	go func() {
-		setup, errSetup = circuits.LoadSetup(cfg, circuits.ExecutionLimitlessCircuitID)
-		close(chSetupDone)
-	}()
+	// Skip the outer-wrap setup load in stop-before-wrap mode: it loads the wrap
+	// constraint system + proving key + BLS12-377 SRS (a large part of the ~191GB
+	// peak) which is unused when the wrap is skipped.
+	if !cfg.Execution.StopBeforeWrap {
+		go func() {
+			setup, errSetup = circuits.LoadSetup(cfg, circuits.ExecutionLimitlessCircuitID)
+			close(chSetupDone)
+		}()
+	}
 
 	// Pre-start trace file decompression and parsing in background.
 	preReadCh := make(chan arithmetization.PreReadResult, 1)
@@ -352,6 +357,15 @@ func ProveOnTheFly(cfg *config.Config, req *execution.Request) (*execution.Respo
 	}
 
 	congFinalproof := res.proof
+
+	if cfg.Execution.StopBeforeWrap {
+		// POC: emit the pre-wrap conglomeration proof and skip the BLS12-377
+		// PLONK wrap (and its setup load, gated above).
+		if err := emitPreWrapProof(cfg, congFinalproof.GetOuterProofInput()); err != nil {
+			return nil, fmt.Errorf("emit pre-wrap proof: %w", err)
+		}
+		return &out, nil
+	}
 
 	// Wait for setup (started during build phase; should be done by now)
 	<-chSetupDone
