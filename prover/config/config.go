@@ -302,6 +302,20 @@ type Execution struct {
 	// PrewrapProofPath is where the emitted pre-wrap proof is written when
 	// StopBeforeWrap is set. Set by the CLI layer (from --prewrap-out).
 	PrewrapProofPath string `mapstructure:"prewrap_proof_path"`
+
+	// ConglomerationSpillDir, when non-empty, enables disk-spill (streaming) of
+	// the hierarchical-conglomeration proof queue: segment proofs beyond a small
+	// resident budget are serialized to this directory and loaded just-in-time
+	// per merge, cutting the coordinator's peak memory from the full N-proof
+	// working set (which can be tens of GB) to the few proofs each in-flight
+	// merge holds. This lets a RAM-constrained coordinator conglomerate a block
+	// whose proofs would otherwise not fit in memory. Empty (default) keeps every
+	// proof in RAM and the conglomeration code path is byte-for-byte unchanged.
+	// Use "auto" for a temp subdirectory. MUST be disk-backed (a tmpfs/RAM path
+	// would defeat the purpose). Tuning: LIMITLESS_MERGE_RESIDENT_MAX (resident
+	// proof budget) and LIMITLESS_MERGE_SPILL_COMPRESS (default true; false uses
+	// zero-copy mmap loads for lower heap at the cost of more disk).
+	ConglomerationSpillDir string `mapstructure:"conglomeration_spill_dir"`
 }
 
 type DataAvailability struct {
