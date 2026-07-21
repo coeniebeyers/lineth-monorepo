@@ -121,13 +121,30 @@ func TestConglomerationDiskSpill(t *testing.T) {
 		t.Fatalf("ResolveSpillPolicy: %v", err)
 	}
 
-	ch := make(chan *distributed.SegmentProof, len(allProofs))
-	for _, p := range allProofs {
-		ch <- p
+	// Feed the queue a mix of sources: even-indexed proofs resident (as the
+	// spill-disabled legacy path produces), odd-indexed spilled at birth (as the
+	// producers and remote dispatch do with spill enabled). This exercises the
+	// budget-free disk enqueue and the just-in-time load of a disk-born proof.
+	//
+	// NOTE the baseline is captured BEFORE the feed loop: with this mix the
+	// at-birth spill inside the loop is the spill this test asserts on — the
+	// queue itself never exceeds its budget with one resident + one disk-born
+	// proof, which is correct behaviour, not a regression. (An earlier version
+	// snapshotted after the loop and failed its own assertion on exactly that.)
+	spilledBefore := limitless.SpilledProofCount()
+	ch := make(chan *limitless.ProofRef, len(allProofs))
+	for i, p := range allProofs {
+		if i%2 == 0 {
+			ch <- limitless.NewResidentProofRef(p)
+			continue
+		}
+		ref, err := limitless.SpillProofAtBirth(spill, p)
+		if err != nil {
+			t.Fatalf("SpillProofAtBirth(proof %d): %v", i, err)
+		}
+		ch <- ref
 	}
 	close(ch)
-
-	spilledBefore := limitless.SpilledProofCount()
 	final, err := limitless.RunConglomerationHierarchical(
 		context.Background(),
 		&distWizard.VerificationKeyMerkleTree,

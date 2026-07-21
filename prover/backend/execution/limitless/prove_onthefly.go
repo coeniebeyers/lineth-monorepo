@@ -166,7 +166,7 @@ func ProveOnTheFly(cfg *config.Config, req *execution.Request) (*execution.Respo
 		proofGLs    = make([]*distributed.SegmentProof, numGL)
 		glErrGroup  = &errgroup.Group{}
 		lppErrGroup = &errgroup.Group{}
-		proofStream = make(chan *distributed.SegmentProof, totalProofs)
+		proofStream = make(chan *ProofRef, totalProofs)
 		resultCh    = make(chan congResult, 1)
 		cong        = dw.CompiledConglomeration
 	)
@@ -245,9 +245,15 @@ func ProveOnTheFly(cfg *config.Config, req *execution.Request) (*execution.Respo
 				return jobErr
 			}
 
-			proofGLs[i] = proofGL
+			// Spill the proof body to disk at birth (when enabled); the stub in
+			// proofGLs keeps the identity fields for the shared-randomness barrier.
+			refGL, err := SpillProofAtBirth(spill, proofGL)
+			if err != nil {
+				return fmt.Errorf("GL witness index=%v: %w", i, err)
+			}
+			proofGLs[i] = &refGL.meta
 			select {
-			case proofStream <- proofGL:
+			case proofStream <- refGL:
 			case <-ctx.Done():
 				return ctx.Err()
 			}
@@ -336,8 +342,12 @@ func ProveOnTheFly(cfg *config.Config, req *execution.Request) (*execution.Respo
 				return jobErr
 			}
 
+			refLPP, err := SpillProofAtBirth(spill, proofLPP)
+			if err != nil {
+				return fmt.Errorf("LPP witness index=%v: %w", i, err)
+			}
 			select {
-			case proofStream <- proofLPP:
+			case proofStream <- refLPP:
 				return nil
 			case <-ctx.Done():
 				return ctx.Err()

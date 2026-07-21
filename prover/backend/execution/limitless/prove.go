@@ -60,11 +60,55 @@ func getEnvPositiveInt(key string, defaultVal int) int {
 	return defaultVal
 }
 
-// proofHandle is a conglomeration-queue element that is either resident in RAM
-// (inMem != nil) or spilled to disk (path != ""). Exactly one is set at a time.
-type proofHandle struct {
-	inMem *distributed.SegmentProof
-	path  string
+// ProofRef references a segment proof that is either resident in RAM
+// (inMem != nil) or on disk (path != ""). Exactly one is set at a time. The
+// meta stub keeps the proof's tiny identity fields (ProofType, ModuleIndex,
+// SegmentIndex, LppCommitment) in RAM even when the multi-GB witness lives on
+// disk, so the shared-randomness barrier and logging never rehydrate a proof.
+type ProofRef struct {
+	inMem      *distributed.SegmentProof
+	path       string
+	compressed bool // serde format of the file at path (remote proofs arrive zstd)
+	meta       distributed.SegmentProof
+}
+
+// metaOf copies just the identity fields of a segment proof.
+func metaOf(p *distributed.SegmentProof) distributed.SegmentProof {
+	return distributed.SegmentProof{
+		ProofType:     p.ProofType,
+		ModuleIndex:   p.ModuleIndex,
+		SegmentIndex:  p.SegmentIndex,
+		LppCommitment: p.LppCommitment,
+	}
+}
+
+// NewResidentProofRef wraps an in-memory segment proof for the conglomeration
+// queue (spill-disabled legacy path, merge results, and tests).
+func NewResidentProofRef(p *distributed.SegmentProof) *ProofRef {
+	return &ProofRef{inMem: p, meta: metaOf(p)}
+}
+
+// newSpilledProofRef points at an existing on-disk serde file (e.g. a proof
+// shipped back from a remote worker) without loading it.
+func newSpilledProofRef(path string, compressed bool, meta distributed.SegmentProof) *ProofRef {
+	return &ProofRef{path: path, compressed: compressed, meta: meta}
+}
+
+// SpillProofAtBirth converts a freshly-proved segment proof into a ProofRef.
+// With spill enabled the witness is serialized to the spill dir immediately and
+// the in-RAM copy is dropped for GC — the coordinator then never accumulates
+// finished proofs in memory while later segments prove (previously ~11 finished
+// proofs x ~3.4 GB sat in RAM/swap behind the segment still proving). Disabled
+// => resident ref, legacy behaviour.
+func SpillProofAtBirth(spill SpillPolicy, proof *distributed.SegmentProof) (*ProofRef, error) {
+	if !spill.enabled() {
+		return NewResidentProofRef(proof), nil
+	}
+	path := filepath.Join(spill.dir, fmt.Sprintf("p-%d.bin", spillSeq.Add(1)))
+	if err := serde.StoreToDisk(path, *proof, spill.compress); err != nil {
+		return nil, fmt.Errorf("spill-at-birth store %s: %w", path, err)
+	}
+	return newSpilledProofRef(path, spill.compress, metaOf(proof)), nil
 }
 
 // SpillPolicy configures disk-spill of the conglomeration proof queue. It is
@@ -241,11 +285,24 @@ func RunDistributedPipeline(cfg *config.Config, zkevmWitness *zkevm.Witness) (*P
 
 		// Conglomeration proof pipeline setup: have a buffered channel proofStream
 		// with capacity large enough so producers won't block
-		proofStream = make(chan *distributed.SegmentProof, totalProofs)
+		proofStream = make(chan *ProofRef, totalProofs)
 		resultCh    = make(chan congResult, 1)
 
 		cong *distributed.RecursedSegmentCompilation
 	)
+
+	// Resolve the spill policy up front (not inside the conglomeration goroutine):
+	// with spill enabled the GL/LPP producers spill each proof to disk at birth,
+	// so they need the policy from the very first segment — long before the
+	// conglomeration asset finishes loading.
+	spill, spillPolicyErr := ResolveSpillPolicy(cfg)
+	if spillPolicyErr != nil {
+		return nil, spillPolicyErr
+	}
+	if spill.enabled() {
+		logrus.Infof("Conglomeration disk-spill enabled (at-birth streaming): dir=%s residentMax=%d compress=%v",
+			spill.dir, spill.residentMax, spill.compress)
+	}
 
 	// -- 2. Launch background hierarchical reduction pipeline to recursively conglomerate as 2 or more
 	// proofs come in. It will exit when it collects `totalProofs` or when ctx is cancelled.
@@ -258,14 +315,8 @@ func RunDistributedPipeline(cfg *config.Config, zkevmWitness *zkevm.Witness) (*P
 		if err != nil || cong == nil {
 			panic(fmt.Errorf("could not load compiled conglomeration: %w", err))
 		}
-		spill, err := ResolveSpillPolicy(cfg)
-		if err != nil {
-			resultCh <- congResult{err: err, congBuf: congBuf}
-			return
-		}
 		if spill.enabled() {
 			defer os.RemoveAll(spill.dir)
-			logrus.Infof("Conglomeration disk-spill enabled: dir=%s residentMax=%d compress=%v", spill.dir, spill.residentMax, spill.compress)
 		}
 		logrus.Infoln("Succesfully loaded the compiled conglomeration and starting to run hierarchical conglomeration")
 		proof, err := RunConglomerationHierarchical(ctx, mt, cong, proofStream, totalProofs, spill)
@@ -294,8 +345,8 @@ func RunDistributedPipeline(cfg *config.Config, zkevmWitness *zkevm.Witness) (*P
 			}
 
 			var (
-				jobErr  error
-				proofGL *distributed.SegmentProof
+				jobErr error
+				refGL  *ProofRef
 			)
 
 			// RunGL may panic and therefore exit the goroutine without returning
@@ -314,7 +365,7 @@ func RunDistributedPipeline(cfg *config.Config, zkevmWitness *zkevm.Witness) (*P
 				}()
 
 				var err error
-				proofGL, err = runGLDispatch(cfg, i, glCache)
+				refGL, err = runGLDispatch(cfg, i, glCache, spill)
 				if err != nil {
 					jobErr = fmt.Errorf("could not run GL prover for witness index=%v: %w", i, err)
 				}
@@ -325,12 +376,13 @@ func RunDistributedPipeline(cfg *config.Config, zkevmWitness *zkevm.Witness) (*P
 				return jobErr
 			}
 
-			// Store local copy for shared randomness computation
-			proofGLs[i] = proofGL
+			// Store the identity stub for shared-randomness computation — it
+			// carries LppCommitment etc. even when the witness lives on disk.
+			proofGLs[i] = &refGL.meta
 
 			// Safe send: if ctx cancelled, abort send
 			select {
-			case proofStream <- proofGL:
+			case proofStream <- refGL:
 			case <-ctx.Done():
 				return ctx.Err()
 			}
@@ -419,8 +471,8 @@ func RunDistributedPipeline(cfg *config.Config, zkevmWitness *zkevm.Witness) (*P
 			}
 
 			var (
-				jobErr   error
-				proofLPP *distributed.SegmentProof
+				jobErr error
+				refLPP *ProofRef
 			)
 
 			// RunLPP may panic and therefore exit the goroutine without returning
@@ -439,7 +491,7 @@ func RunDistributedPipeline(cfg *config.Config, zkevmWitness *zkevm.Witness) (*P
 				}()
 
 				var err error
-				proofLPP, err = runLPPDispatch(cfg, i, sharedRandomness)
+				refLPP, err = runLPPDispatch(cfg, i, sharedRandomness, spill)
 				if err != nil {
 					jobErr = fmt.Errorf("could not run LPP prover for witness index=%v: %w", i, err)
 				}
@@ -450,7 +502,7 @@ func RunDistributedPipeline(cfg *config.Config, zkevmWitness *zkevm.Witness) (*P
 			}
 
 			select {
-			case proofStream <- proofLPP:
+			case proofStream <- refLPP:
 				return nil
 			case <-ctx.Done():
 				return ctx.Err()
@@ -778,7 +830,7 @@ func RunLPP(cfg *config.Config, witnessIndex int, sharedRandomness field.Octuple
 func RunConglomerationHierarchical(ctx context.Context,
 	mt *distributed.VerificationKeyMerkleTree,
 	cong *distributed.RecursedSegmentCompilation,
-	proofStream <-chan *distributed.SegmentProof, totalProofs int,
+	proofStream <-chan *ProofRef, totalProofs int,
 	spill SpillPolicy,
 ) (*distributed.SegmentProof, error) {
 
@@ -786,12 +838,13 @@ func RunConglomerationHierarchical(ctx context.Context,
 	// merge results). Each merge takes 2 items and produces 1, so remaining--.
 	// When remaining == 1 after decrement, the current merge is the final one (BLS).
 	//
-	// Each queue entry is a proofHandle: resident in RAM, or (when spill is enabled
-	// and the resident budget is exceeded) serialized to disk and loaded per-merge.
+	// Each queue entry is a ProofRef: resident in RAM, or on disk (spilled at
+	// birth by the producer, shipped from a remote worker, or spilled here when
+	// the resident budget is exceeded) and loaded per-merge.
 	var (
 		mu         sync.Mutex
 		cond       = sync.NewCond(&mu)
-		items      []*proofHandle
+		items      []*ProofRef
 		residentN  int // count of QUEUED handles currently resident (inMem != nil)
 		checkedOut int // count of proofs materialized in RAM by in-flight merges
 		remaining  = totalProofs
@@ -817,22 +870,24 @@ func RunConglomerationHierarchical(ctx context.Context,
 	// materialized by in-flight merges (checkedOut) — without the latter, N merge
 	// workers hold 2×N proofs outside the budget and, for small proof counts,
 	// spill never triggers at all (the bug the first real-scale run exposed).
-	// Caller MUST hold mu. When spill is disabled this reduces to the legacy
-	// `items = append(items, {inMem:proof})` plus a resident-counter bump —
-	// byte-for-byte the same ordering and pointer semantics as before.
-	enqueue := func(proof *distributed.SegmentProof) {
-		h := &proofHandle{inMem: proof}
-		if spill.enabled() && residentN+checkedOut >= spill.residentMax {
-			path := filepath.Join(spill.dir, fmt.Sprintf("p-%d.bin", spillSeq.Add(1)))
-			if err := serde.StoreToDisk(path, *proof, spill.compress); err != nil {
-				spillErr = fmt.Errorf("conglomeration spill store %s: %w", path, err)
-				cancelled = true
-				cond.Broadcast()
-				return
+	// Caller MUST hold mu. Refs that are already on disk (spilled at birth or
+	// shipped from a worker) enqueue without touching the budget. When spill is
+	// disabled this reduces to the legacy resident append — byte-for-byte the
+	// same ordering and pointer semantics as before.
+	enqueue := func(h *ProofRef) {
+		if h.inMem != nil {
+			if spill.enabled() && residentN+checkedOut >= spill.residentMax {
+				path := filepath.Join(spill.dir, fmt.Sprintf("p-%d.bin", spillSeq.Add(1)))
+				if err := serde.StoreToDisk(path, *h.inMem, spill.compress); err != nil {
+					spillErr = fmt.Errorf("conglomeration spill store %s: %w", path, err)
+					cancelled = true
+					cond.Broadcast()
+					return
+				}
+				h.inMem, h.path, h.compressed = nil, path, spill.compress
+			} else {
+				residentN++
 			}
-			h.inMem, h.path = nil, path
-		} else {
-			residentN++
 		}
 		items = append(items, h)
 	}
@@ -840,12 +895,12 @@ func RunConglomerationHierarchical(ctx context.Context,
 	// load materializes a handle just before its merge. The returned io.Closer
 	// MUST be closed only AFTER the merge has fully consumed the proof (on the
 	// mmap path the proof aliases the file). Resident handles return a no-op closer.
-	load := func(h *proofHandle) (*distributed.SegmentProof, io.Closer, error) {
+	load := func(h *ProofRef) (*distributed.SegmentProof, io.Closer, error) {
 		if h.inMem != nil {
 			return h.inMem, io.NopCloser(nil), nil
 		}
 		var sp distributed.SegmentProof
-		closer, err := serde.LoadFromDisk(h.path, &sp, spill.compress)
+		closer, err := serde.LoadFromDisk(h.path, &sp, h.compressed)
 		if err != nil {
 			return nil, nil, fmt.Errorf("conglomeration spill load %s: %w", h.path, err)
 		}
@@ -861,13 +916,15 @@ func RunConglomerationHierarchical(ctx context.Context,
 		mu.Unlock()
 	}()
 
-	// Drain proofStream into the queue (spilling to disk when over the resident budget).
+	// Drain proofStream into the queue. Refs already on disk (spilled at birth /
+	// shipped from a worker) enqueue budget-free; resident ones spill here when
+	// over the resident budget.
 	go func() {
-		for proof := range proofStream {
+		for h := range proofStream {
 			mu.Lock()
-			enqueue(proof)
-			logrus.Infof("Received proof (proofType, moduleIdx, segmentIdx) = (%d, %d, %d) for conglomeration",
-				proof.ProofType, proof.ModuleIndex, proof.SegmentIndex)
+			enqueue(h)
+			logrus.Infof("Received proof (proofType, moduleIdx, segmentIdx) = (%d, %d, %d) for conglomeration (onDisk=%v)",
+				h.meta.ProofType, h.meta.ModuleIndex, h.meta.SegmentIndex, h.inMem == nil)
 			cond.Broadcast()
 			mu.Unlock()
 		}
@@ -973,11 +1030,11 @@ func RunConglomerationHierarchical(ctx context.Context,
 				if isLast {
 					// Never spill the final proof — it is returned to the caller
 					// directly, so writing it to disk would be wasted I/O.
-					items = append(items, &proofHandle{inMem: aggregated})
+					items = append(items, NewResidentProofRef(aggregated))
 					residentN++
 					finalProof = aggregated
 				} else {
-					enqueue(aggregated)
+					enqueue(NewResidentProofRef(aggregated))
 				}
 				cond.Broadcast()
 				mu.Unlock()

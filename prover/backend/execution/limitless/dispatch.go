@@ -134,38 +134,50 @@ func release(s chan struct{}) {
 	}
 }
 
-// runGLDispatch proves GL segment i locally, or remotely if it is assigned to a worker.
-func runGLDispatch(cfg *config.Config, i int, cache *circuitCache) (*distributed.SegmentProof, error) {
+// runGLDispatch proves GL segment i locally, or remotely if it is assigned to a
+// worker. The result is returned as a ProofRef: with spill enabled the proof
+// body goes to disk immediately (at birth) and only the identity stub stays in RAM.
+func runGLDispatch(cfg *config.Config, i int, cache *circuitCache, spill SpillPolicy) (*ProofRef, error) {
 	if w := workerFor("GL", i); w != "" {
 		sem := remoteSemFor(w)
 		acquire(sem)
 		defer release(sem)
-		return runSegmentRemote(cfg, w, "GL", i, nil)
+		return runSegmentRemote(cfg, spill, w, "GL", i, nil)
 	}
 	acquire(localSem)
 	defer release(localSem)
-	return RunGL(cfg, i, cache)
+	p, err := RunGL(cfg, i, cache)
+	if err != nil {
+		return nil, err
+	}
+	return SpillProofAtBirth(spill, p)
 }
 
 // runLPPDispatch proves LPP segment i locally, or remotely if assigned to a worker.
 // sr is the shared randomness the coordinator derived from all GL proofs (the barrier).
-func runLPPDispatch(cfg *config.Config, i int, sr field.Octuplet) (*distributed.SegmentProof, error) {
+func runLPPDispatch(cfg *config.Config, i int, sr field.Octuplet, spill SpillPolicy) (*ProofRef, error) {
 	if w := workerFor("LPP", i); w != "" {
 		sem := remoteSemFor(w)
 		acquire(sem)
 		defer release(sem)
-		return runSegmentRemote(cfg, w, "LPP", i, &sr)
+		return runSegmentRemote(cfg, spill, w, "LPP", i, &sr)
 	}
 	acquire(localSem)
 	defer release(localSem)
-	return RunLPP(cfg, i, sr)
+	p, err := RunLPP(cfg, i, sr)
+	if err != nil {
+		return nil, err
+	}
+	return SpillProofAtBirth(spill, p)
 }
 
 // runSegmentRemote ships witness-<kind>-<i> to the given worker, runs prove-segment
-// there, ships the SegmentProof back, and deserializes it. sr is the shared-randomness
-// octuplet (LPP only; nil for GL). The returned proof is bit-identical to a locally-proved
-// one, so it flows into the shared-randomness barrier and conglomeration unchanged.
-func runSegmentRemote(cfg *config.Config, worker, kind string, i int, sr *field.Octuplet) (*distributed.SegmentProof, error) {
+// there, and ships the SegmentProof back. sr is the shared-randomness octuplet (LPP
+// only; nil for GL). With spill enabled the shipped file is registered as-is (the
+// worker's tiny .meta sidecar supplies the identity fields) — the multi-GB proof is
+// never deserialized on the coordinator until its merge. Without spill it is loaded
+// eagerly into RAM, exactly as before.
+func runSegmentRemote(cfg *config.Config, spill SpillPolicy, worker, kind string, i int, sr *field.Octuplet) (*ProofRef, error) {
 	rdir := remoteDir()
 	localWitness := fmt.Sprintf("%s/witness-%s-%d", witnessDir, kind, i)
 	remoteWitness := fmt.Sprintf("%s/witness-%s-%d", rdir, kind, i)
@@ -205,10 +217,32 @@ func runSegmentRemote(cfg *config.Config, worker, kind string, i int, sr *field.
 		return nil, fmt.Errorf("dispatch %s-%d: remote prove-segment: %w", kind, i, err)
 	}
 
-	// 4. ship the proof back and deserialize (the worker wrote it compressed).
+	// 4. ship the proof back (the worker wrote it compressed).
 	if err := runCmd("scp", "-q", worker+":"+remoteProof, localProof); err != nil {
 		return nil, fmt.Errorf("dispatch %s-%d: scp proof back: %w", kind, i, err)
 	}
+
+	// With spill enabled the shipped file IS the spill file: fetch the worker's
+	// tiny .meta sidecar for the identity fields and register the proof on disk
+	// without deserializing 3+ GB here. Missing/unreadable sidecar (e.g. an older
+	// worker binary) falls back to the eager load below.
+	if spill.enabled() {
+		localMeta := localProof + ".meta"
+		if err := runCmd("scp", "-q", worker+":"+remoteProof+".meta", localMeta); err == nil {
+			var meta distributed.SegmentProof
+			closer, err := serde.LoadFromDisk(localMeta, &meta, false)
+			if err == nil {
+				closer.Close()
+				os.Remove(localMeta)
+				logrus.Infof("dispatch: %s segment %d proved remotely; registered on disk without deserializing", kind, i)
+				return newSpilledProofRef(localProof, true, meta), nil
+			}
+			logrus.Warnf("dispatch: %s-%d meta sidecar unreadable (%v); falling back to eager load", kind, i, err)
+		} else {
+			logrus.Warnf("dispatch: %s-%d worker sent no meta sidecar; falling back to eager load", kind, i)
+		}
+	}
+
 	var proof distributed.SegmentProof
 	closer, err := serde.LoadFromDisk(localProof, &proof, true)
 	if err != nil {
@@ -216,7 +250,7 @@ func runSegmentRemote(cfg *config.Config, worker, kind string, i int, sr *field.
 	}
 	closer.Close()
 	logrus.Infof("dispatch: %s segment %d proved remotely and collected", kind, i)
-	return &proof, nil
+	return NewResidentProofRef(&proof), nil
 }
 
 // runCmd runs an external command, folding stderr into the error on failure.

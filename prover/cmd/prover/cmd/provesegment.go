@@ -89,6 +89,18 @@ func ProveSegment(args ProveSegmentArgs) error {
 	if err := serde.StoreToDisk(args.Out, *proof, true); err != nil {
 		return fmt.Errorf("prove-segment: write proof %v: %w", args.Out, err)
 	}
-	logrus.Infof("prove-segment: wrote SegmentProof to %s (%s segment)", args.Out, args.Kind)
+
+	// Tiny identity sidecar (<1 KB): lets the coordinator register the shipped
+	// proof on disk (spill-at-birth) without deserializing the multi-GB body.
+	meta := distributed.SegmentProof{
+		ProofType:     proof.ProofType,
+		ModuleIndex:   proof.ModuleIndex,
+		SegmentIndex:  proof.SegmentIndex,
+		LppCommitment: proof.LppCommitment,
+	}
+	if err := serde.StoreToDisk(args.Out+".meta", meta, false); err != nil {
+		return fmt.Errorf("prove-segment: write meta sidecar %v: %w", args.Out+".meta", err)
+	}
+	logrus.Infof("prove-segment: wrote SegmentProof to %s (+.meta sidecar, %s segment)", args.Out, args.Kind)
 	return nil
 }
