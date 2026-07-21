@@ -53,6 +53,15 @@ var (
 		RunE:  cmdVerify,
 	}
 	verifyArgs cmd.VerifyArgs
+
+	// proveSegmentCmd (POC, multi-node worker) proves one limitless segment from a
+	// witness file shipped by the coordinator, writing the SegmentProof to ship back.
+	proveSegmentCmd = &cobra.Command{
+		Use:   "prove-segment",
+		Short: "POC multi-node worker: prove one limitless segment from a witness file",
+		RunE:  cmdProveSegment,
+	}
+	proveSegmentArgs cmd.ProveSegmentArgs
 )
 
 func main() {
@@ -90,6 +99,12 @@ func init() {
 	rootCmd.AddCommand(verifyCmd)
 	verifyCmd.Flags().StringVar(&verifyArgs.Proof, "proof", "", "path to the pre-wrap proof to verify")
 
+	rootCmd.AddCommand(proveSegmentCmd)
+	proveSegmentCmd.Flags().StringVar(&proveSegmentArgs.Kind, "kind", "", "segment kind: GL or LPP")
+	proveSegmentCmd.Flags().StringVar(&proveSegmentArgs.Witness, "witness", "", "path to the module witness file (shipped by the coordinator)")
+	proveSegmentCmd.Flags().StringVar(&proveSegmentArgs.SharedRand, "shared-randomness", "", "LPP only: path to the serialized shared-randomness octuplet")
+	proveSegmentCmd.Flags().StringVar(&proveSegmentArgs.Out, "out", "", "path to write the serialized SegmentProof")
+
 	rootCmd.AddCommand(logStatsCmd)
 	logStatsCmd.Flags().StringVar(&logStatsArgs.Input, "in", "", "input file")
 	logStatsCmd.Flags().StringVar(&logStatsArgs.StatsFile, "stats-file", "", "stats file where to log the result")
@@ -108,6 +123,11 @@ func cmdProve(*cobra.Command, []string) error {
 func cmdVerify(*cobra.Command, []string) error {
 	verifyArgs.ConfigFile = fConfigFile
 	return cmd.Verify(verifyArgs)
+}
+
+func cmdProveSegment(*cobra.Command, []string) error {
+	proveSegmentArgs.ConfigFile = fConfigFile
+	return cmd.ProveSegment(proveSegmentArgs)
 }
 
 func cmdLogStats(_cmd *cobra.Command, _ []string) error {

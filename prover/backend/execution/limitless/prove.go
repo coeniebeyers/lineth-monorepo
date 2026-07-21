@@ -38,8 +38,11 @@ var (
 	// jobs. Override via LIMITLESS_SUBPROVER_JOBS.
 	numConcurrentSubProverJobs = getEnvPositiveInt("LIMITLESS_SUBPROVER_JOBS", 5)
 	// numConcurrentMergeJobs governs the number of concurrent conglomeration
-	// merge operations during hierarchical reduction.
-	numConcurrentMergeJobs = 4
+	// merge operations during hierarchical reduction. Each merge holds ~two
+	// multi-GB segment proofs + its recursion working set, so on RAM-constrained
+	// coordinators lowering this (e.g. 1-2) cuts peak memory and swap-thrash.
+	// Override via LIMITLESS_MERGE_JOBS.
+	numConcurrentMergeJobs = getEnvPositiveInt("LIMITLESS_MERGE_JOBS", 4)
 )
 
 // getEnvPositiveInt reads a positive integer from an environment variable,
@@ -250,7 +253,7 @@ func RunDistributedPipeline(cfg *config.Config, zkevmWitness *zkevm.Witness) (*P
 				}()
 
 				var err error
-				proofGL, err = RunGL(cfg, i, glCache)
+				proofGL, err = runGLDispatch(cfg, i, glCache)
 				if err != nil {
 					jobErr = fmt.Errorf("could not run GL prover for witness index=%v: %w", i, err)
 				}
@@ -375,7 +378,7 @@ func RunDistributedPipeline(cfg *config.Config, zkevmWitness *zkevm.Witness) (*P
 				}()
 
 				var err error
-				proofLPP, err = RunLPP(cfg, i, sharedRandomness)
+				proofLPP, err = runLPPDispatch(cfg, i, sharedRandomness)
 				if err != nil {
 					jobErr = fmt.Errorf("could not run LPP prover for witness index=%v: %w", i, err)
 				}
