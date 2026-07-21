@@ -3,6 +3,7 @@ package limitless
 import (
 	"context"
 	"fmt"
+	"os"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -166,8 +167,16 @@ func ProveOnTheFly(cfg *config.Config, req *execution.Request) (*execution.Respo
 	)
 
 	// Launch conglomeration pipeline
+	spill, err := ResolveSpillPolicy(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("could not resolve conglomeration spill policy: %w", err)
+	}
+	if spill.enabled() {
+		defer os.RemoveAll(spill.dir)
+		logrus.Infof("Conglomeration disk-spill enabled: dir=%s residentMax=%d compress=%v", spill.dir, spill.residentMax, spill.compress)
+	}
 	go func() {
-		proof, err := RunConglomerationHierarchical(ctx, mt, cong, proofStream, totalProofs)
+		proof, err := RunConglomerationHierarchical(ctx, mt, cong, proofStream, totalProofs, spill)
 		resultCh <- congResult{proof: proof, err: err}
 	}()
 

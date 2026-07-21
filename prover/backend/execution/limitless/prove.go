@@ -3,13 +3,16 @@ package limitless
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/consensys/linea-monorepo/prover/backend/execution"
 	"github.com/consensys/linea-monorepo/prover/circuits"
@@ -38,8 +41,12 @@ var (
 	// jobs. Override via LIMITLESS_SUBPROVER_JOBS.
 	numConcurrentSubProverJobs = getEnvPositiveInt("LIMITLESS_SUBPROVER_JOBS", 5)
 	// numConcurrentMergeJobs governs the number of concurrent conglomeration
-	// merge operations during hierarchical reduction.
-	numConcurrentMergeJobs = 4
+	// merge operations during hierarchical reduction. Each in-flight merge holds
+	// its two input proofs plus its recursion working set, so this multiplies the
+	// coordinator's peak memory. Lower it (e.g. 1) on RAM-constrained coordinators;
+	// combined with ConglomerationSpillDir the queue no longer backlogs in RAM when
+	// merges are slower. Override via LIMITLESS_MERGE_JOBS.
+	numConcurrentMergeJobs = getEnvPositiveInt("LIMITLESS_MERGE_JOBS", 4)
 )
 
 // getEnvPositiveInt reads a positive integer from an environment variable,
@@ -51,6 +58,49 @@ func getEnvPositiveInt(key string, defaultVal int) int {
 		}
 	}
 	return defaultVal
+}
+
+// proofHandle is a conglomeration-queue element that is either resident in RAM
+// (inMem != nil) or spilled to disk (path != ""). Exactly one is set at a time.
+type proofHandle struct {
+	inMem *distributed.SegmentProof
+	path  string
+}
+
+// SpillPolicy configures disk-spill of the conglomeration proof queue. It is
+// disabled (all-RAM, legacy behaviour) when dir == "".
+type SpillPolicy struct {
+	dir         string // per-run spill directory; "" => disabled
+	residentMax int    // max proofs kept resident before newcomers spill
+	compress    bool   // zstd on disk (smaller disk, heap decode) vs zero-copy mmap
+}
+
+func (s SpillPolicy) enabled() bool { return s.dir != "" }
+
+// spillSeq generates unique spill filenames across concurrent merges.
+var spillSeq atomic.Uint64
+
+// ResolveSpillPolicy translates cfg.Execution.ConglomerationSpillDir into a
+// policy. An empty dir returns a disabled policy (the legacy all-RAM path). It
+// creates a per-run subdirectory so concurrent prover processes sharing a volume
+// don't collide and the whole run's files can be removed on exit.
+func ResolveSpillPolicy(cfg *config.Config) (SpillPolicy, error) {
+	dir := cfg.Execution.ConglomerationSpillDir
+	if dir == "" {
+		return SpillPolicy{}, nil // disabled
+	}
+	if dir == "auto" {
+		dir = filepath.Join(os.TempDir(), "linea-conglo-spill")
+	}
+	dir = filepath.Join(dir, fmt.Sprintf("run-%d-%d", os.Getpid(), time.Now().UnixNano()))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return SpillPolicy{}, fmt.Errorf("conglomeration spill: mkdir %s: %w", dir, err)
+	}
+	return SpillPolicy{
+		dir:         dir,
+		residentMax: getEnvPositiveInt("LIMITLESS_MERGE_RESIDENT_MAX", 2*numConcurrentMergeJobs),
+		compress:    os.Getenv("LIMITLESS_MERGE_SPILL_COMPRESS") != "false",
+	}, nil
 }
 
 // PipelineResult holds the output of RunDistributedPipeline.
@@ -176,8 +226,17 @@ func RunDistributedPipeline(cfg *config.Config, zkevmWitness *zkevm.Witness) (*P
 		if err != nil || cong == nil {
 			panic(fmt.Errorf("could not load compiled conglomeration: %w", err))
 		}
+		spill, err := ResolveSpillPolicy(cfg)
+		if err != nil {
+			resultCh <- congResult{err: err, congBuf: congBuf}
+			return
+		}
+		if spill.enabled() {
+			defer os.RemoveAll(spill.dir)
+			logrus.Infof("Conglomeration disk-spill enabled: dir=%s residentMax=%d compress=%v", spill.dir, spill.residentMax, spill.compress)
+		}
 		logrus.Infoln("Succesfully loaded the compiled conglomeration and starting to run hierarchical conglomeration")
-		proof, err := RunConglomerationHierarchical(ctx, mt, cong, proofStream, totalProofs)
+		proof, err := RunConglomerationHierarchical(ctx, mt, cong, proofStream, totalProofs, spill)
 		resultCh <- congResult{proof: proof, err: err, congBuf: congBuf}
 	}()
 
@@ -678,19 +737,73 @@ func RunConglomerationHierarchical(ctx context.Context,
 	mt *distributed.VerificationKeyMerkleTree,
 	cong *distributed.RecursedSegmentCompilation,
 	proofStream <-chan *distributed.SegmentProof, totalProofs int,
+	spill SpillPolicy,
 ) (*distributed.SegmentProof, error) {
 
 	// `remaining` tracks how many items are in the system (items slice + in-flight
 	// merge results). Each merge takes 2 items and produces 1, so remaining--.
 	// When remaining == 1 after decrement, the current merge is the final one (BLS).
+	//
+	// Each queue entry is a proofHandle: resident in RAM, or (when spill is enabled
+	// and the resident budget is exceeded) serialized to disk and loaded per-merge.
 	var (
 		mu         sync.Mutex
 		cond       = sync.NewCond(&mu)
-		items      []*distributed.SegmentProof
+		items      []*proofHandle
+		residentN  int // count of handles currently resident (inMem != nil)
 		remaining  = totalProofs
 		mergeCount int
 		cancelled  bool
+		spillErr   error // first spill I/O error; aborts the run
 	)
+
+	// abort records the first spill error and unblocks parked workers. Callers
+	// must NOT already hold mu.
+	abort := func(err error) {
+		mu.Lock()
+		if spillErr == nil {
+			spillErr = err
+		}
+		cancelled = true
+		cond.Broadcast()
+		mu.Unlock()
+	}
+
+	// enqueue appends a proof, spilling it to disk once the resident budget is
+	// exceeded. Caller MUST hold mu. When spill is disabled this reduces to the
+	// legacy `items = append(items, {inMem:proof})` plus a resident-counter bump —
+	// byte-for-byte the same ordering and pointer semantics as before.
+	enqueue := func(proof *distributed.SegmentProof) {
+		h := &proofHandle{inMem: proof}
+		if spill.enabled() && residentN >= spill.residentMax {
+			path := filepath.Join(spill.dir, fmt.Sprintf("p-%d.bin", spillSeq.Add(1)))
+			if err := serde.StoreToDisk(path, *proof, spill.compress); err != nil {
+				spillErr = fmt.Errorf("conglomeration spill store %s: %w", path, err)
+				cancelled = true
+				cond.Broadcast()
+				return
+			}
+			h.inMem, h.path = nil, path
+		} else {
+			residentN++
+		}
+		items = append(items, h)
+	}
+
+	// load materializes a handle just before its merge. The returned io.Closer
+	// MUST be closed only AFTER the merge has fully consumed the proof (on the
+	// mmap path the proof aliases the file). Resident handles return a no-op closer.
+	load := func(h *proofHandle) (*distributed.SegmentProof, io.Closer, error) {
+		if h.inMem != nil {
+			return h.inMem, io.NopCloser(nil), nil
+		}
+		var sp distributed.SegmentProof
+		closer, err := serde.LoadFromDisk(h.path, &sp, spill.compress)
+		if err != nil {
+			return nil, nil, fmt.Errorf("conglomeration spill load %s: %w", h.path, err)
+		}
+		return &sp, closer, nil
+	}
 
 	// Signal workers on context cancellation.
 	go func() {
@@ -701,11 +814,11 @@ func RunConglomerationHierarchical(ctx context.Context,
 		mu.Unlock()
 	}()
 
-	// Drain proofStream into items.
+	// Drain proofStream into the queue (spilling to disk when over the resident budget).
 	go func() {
 		for proof := range proofStream {
 			mu.Lock()
-			items = append(items, proof)
+			enqueue(proof)
 			logrus.Infof("Received proof (proofType, moduleIdx, segmentIdx) = (%d, %d, %d) for conglomeration",
 				proof.ProofType, proof.ModuleIndex, proof.SegmentIndex)
 			cond.Broadcast()
@@ -734,20 +847,41 @@ func RunConglomerationHierarchical(ctx context.Context,
 					return
 				}
 
-				// Take 2 items from the end (LIFO — matches prior behavior).
+				// Take 2 handles from the end (LIFO — matches prior behavior).
 				n := len(items)
-				p1 := items[n-1]
-				p2 := items[n-2]
+				h1 := items[n-1]
+				h2 := items[n-2]
 				items[n-1] = nil
 				items[n-2] = nil
 				items = items[:n-2]
+				if h1.inMem != nil {
+					residentN--
+				}
+				if h2.inMem != nil {
+					residentN--
+				}
 				remaining--
 				isLast := remaining == 1
 				idx := mergeCount
 				mergeCount++
 				mu.Unlock()
 
-				// Clear runtime on the first proof to free proving transients.
+				// Materialize the two proofs (resident, or loaded from disk if spilled).
+				p1, c1, err := load(h1)
+				if err != nil {
+					abort(err)
+					return
+				}
+				p2, c2, err := load(h2)
+				if err != nil {
+					c1.Close()
+					abort(err)
+					return
+				}
+
+				// Clear runtime on the first proof to free proving transients. A
+				// spilled proof already has recursionRuntime==nil (serde:"omit"), so
+				// this is a harmless no-op on that path and preserves parity.
 				p1 = p1.ClearRuntime()
 
 				mergeType := "koala"
@@ -772,8 +906,19 @@ func RunConglomerationHierarchical(ctx context.Context,
 					aggregated = cong.ProveSegmentKoala(wit)
 				}
 
+				// The merge has consumed wit; release the inputs (unmap on the mmap
+				// path) and delete their spill files.
+				c1.Close()
+				c2.Close()
+				if h1.path != "" {
+					os.Remove(h1.path)
+				}
+				if h2.path != "" {
+					os.Remove(h2.path)
+				}
+
 				mu.Lock()
-				items = append(items, aggregated)
+				enqueue(aggregated)
 				if isLast {
 					finalProof = aggregated
 				}
@@ -786,6 +931,9 @@ func RunConglomerationHierarchical(ctx context.Context,
 	wg.Wait()
 
 	if cancelled {
+		if spillErr != nil {
+			return nil, spillErr
+		}
 		return nil, ctx.Err()
 	}
 
