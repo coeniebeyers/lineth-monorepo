@@ -80,6 +80,11 @@ func (s SpillPolicy) enabled() bool { return s.dir != "" }
 // spillSeq generates unique spill filenames across concurrent merges.
 var spillSeq atomic.Uint64
 
+// SpilledProofCount returns the number of proofs spilled to disk so far in this
+// process. Test/metrics hook: the spill files themselves are deleted as merges
+// consume them, so post-run this counter is the only trace that spilling happened.
+func SpilledProofCount() uint64 { return spillSeq.Load() }
+
 // ResolveSpillPolicy translates cfg.Execution.ConglomerationSpillDir into a
 // policy. An empty dir returns a disabled policy (the legacy all-RAM path). It
 // creates a per-run subdirectory so concurrent prover processes sharing a volume
@@ -787,7 +792,8 @@ func RunConglomerationHierarchical(ctx context.Context,
 		mu         sync.Mutex
 		cond       = sync.NewCond(&mu)
 		items      []*proofHandle
-		residentN  int // count of handles currently resident (inMem != nil)
+		residentN  int // count of QUEUED handles currently resident (inMem != nil)
+		checkedOut int // count of proofs materialized in RAM by in-flight merges
 		remaining  = totalProofs
 		mergeCount int
 		cancelled  bool
@@ -807,12 +813,16 @@ func RunConglomerationHierarchical(ctx context.Context,
 	}
 
 	// enqueue appends a proof, spilling it to disk once the resident budget is
-	// exceeded. Caller MUST hold mu. When spill is disabled this reduces to the
-	// legacy `items = append(items, {inMem:proof})` plus a resident-counter bump —
+	// exceeded. The budget counts BOTH queued resident handles and proofs
+	// materialized by in-flight merges (checkedOut) — without the latter, N merge
+	// workers hold 2×N proofs outside the budget and, for small proof counts,
+	// spill never triggers at all (the bug the first real-scale run exposed).
+	// Caller MUST hold mu. When spill is disabled this reduces to the legacy
+	// `items = append(items, {inMem:proof})` plus a resident-counter bump —
 	// byte-for-byte the same ordering and pointer semantics as before.
 	enqueue := func(proof *distributed.SegmentProof) {
 		h := &proofHandle{inMem: proof}
-		if spill.enabled() && residentN >= spill.residentMax {
+		if spill.enabled() && residentN+checkedOut >= spill.residentMax {
 			path := filepath.Join(spill.dir, fmt.Sprintf("p-%d.bin", spillSeq.Add(1)))
 			if err := serde.StoreToDisk(path, *proof, spill.compress); err != nil {
 				spillErr = fmt.Errorf("conglomeration spill store %s: %w", path, err)
@@ -897,6 +907,10 @@ func RunConglomerationHierarchical(ctx context.Context,
 				if h2.inMem != nil {
 					residentN--
 				}
+				// Both inputs are about to be materialized in RAM for the merge
+				// (resident ones already are; spilled ones get loaded), so they
+				// count against the resident budget until the merge frees them.
+				checkedOut += 2
 				remaining--
 				isLast := remaining == 1
 				idx := mergeCount
@@ -955,9 +969,15 @@ func RunConglomerationHierarchical(ctx context.Context,
 				}
 
 				mu.Lock()
-				enqueue(aggregated)
+				checkedOut -= 2
 				if isLast {
+					// Never spill the final proof — it is returned to the caller
+					// directly, so writing it to disk would be wasted I/O.
+					items = append(items, &proofHandle{inMem: aggregated})
+					residentN++
 					finalProof = aggregated
+				} else {
+					enqueue(aggregated)
 				}
 				cond.Broadcast()
 				mu.Unlock()

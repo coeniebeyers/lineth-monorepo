@@ -127,6 +127,7 @@ func TestConglomerationDiskSpill(t *testing.T) {
 	}
 	close(ch)
 
+	spilledBefore := limitless.SpilledProofCount()
 	final, err := limitless.RunConglomerationHierarchical(
 		context.Background(),
 		&distWizard.VerificationKeyMerkleTree,
@@ -139,5 +140,15 @@ func TestConglomerationDiskSpill(t *testing.T) {
 	if final == nil {
 		t.Fatal("spill-enabled conglomeration returned a nil final proof")
 	}
-	t.Logf("spill-enabled conglomeration merged %d segments (all spilled to disk) into a valid final proof", len(allProofs))
+
+	// A valid final proof alone does NOT prove the spill path ran: if the resident
+	// budget never bites (the accounting bug the first real-scale run exposed —
+	// merge workers held proofs outside the budget), the run silently degrades to
+	// the everything-in-RAM path and this test passes vacuously. Spill files are
+	// deleted as merges consume them, so assert via the process-wide spill counter.
+	spilled := limitless.SpilledProofCount() - spilledBefore
+	if spilled == 0 {
+		t.Fatal("spill-enabled conglomeration with residentMax=1 never spilled a proof to disk — the resident budget is not being enforced")
+	}
+	t.Logf("spill-enabled conglomeration merged %d segments (%d spilled to disk) into a valid final proof", len(allProofs), spilled)
 }
