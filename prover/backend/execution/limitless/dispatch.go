@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/consensys/linea-monorepo/prover/config"
 	"github.com/consensys/linea-monorepo/prover/maths/field"
@@ -23,14 +24,30 @@ import (
 // (default, the single-node path is untouched).
 //
 // Env:
-//   LIMITLESS_REMOTE_WORKER  ssh host of the worker (e.g. "node2"); empty disables dispatch
-//   LIMITLESS_REMOTE_GL      comma list of GL segment indices to send remote (e.g. "1,4")
-//   LIMITLESS_REMOTE_LPP     comma list of LPP segment indices to send remote
-//   LIMITLESS_REMOTE_DIR     remote working dir (default /tmp/prover-remote)
-//   LIMITLESS_REMOTE_CONFIG  config path on the worker (points at the worker's local assets)
-//   LIMITLESS_REMOTE_BIN     prover binary path on the worker (default "prover-poc")
+//   LIMITLESS_REMOTE_WORKER  comma list of ssh hosts (e.g. "node2" or "node2,work-hp");
+//                            empty disables dispatch
+//   LIMITLESS_REMOTE_GL      GL segment indices to send remote. Either a flat comma list
+//                            ("1,4" — all go to the first worker), or per-worker groups
+//                            "node2:2,3;work-hp:4,5"
+//   LIMITLESS_REMOTE_LPP     LPP segment indices, same syntax as LIMITLESS_REMOTE_GL
+//   LIMITLESS_REMOTE_DIR     remote working dir (default /tmp/prover-remote, same on all workers)
+//   LIMITLESS_REMOTE_CONFIG  config path on the workers (points at each worker's local assets;
+//                            same path on all workers)
+//   LIMITLESS_REMOTE_BIN     prover binary path on the workers (default "prover-poc")
 
-func remoteWorker() string { return os.Getenv("LIMITLESS_REMOTE_WORKER") }
+func remoteWorkers() []string {
+	v := os.Getenv("LIMITLESS_REMOTE_WORKER")
+	if v == "" {
+		return nil
+	}
+	var ws []string
+	for _, w := range strings.Split(v, ",") {
+		if w = strings.TrimSpace(w); w != "" {
+			ws = append(ws, w)
+		}
+	}
+	return ws
+}
 
 func remoteDir() string {
 	if d := os.Getenv("LIMITLESS_REMOTE_DIR"); d != "" {
@@ -48,28 +65,53 @@ func remoteBin() string {
 	return "prover-poc"
 }
 
-// isRemote reports whether segment index i of the given kind ("GL"/"LPP") is assigned to
-// the remote worker via the LIMITLESS_REMOTE_<KIND> comma list.
-func isRemote(kind string, i int) bool {
-	if remoteWorker() == "" {
-		return false
+// workerFor returns the ssh host that segment index i of the given kind ("GL"/"LPP") is
+// assigned to via LIMITLESS_REMOTE_<KIND>, or "" if the segment proves locally. The spec
+// is either a flat comma list of indices ("2,3" — all assigned to the first worker) or
+// semicolon-separated per-worker groups ("node2:2,3;work-hp:4,5").
+func workerFor(kind string, i int) string {
+	workers := remoteWorkers()
+	if len(workers) == 0 {
+		return ""
 	}
-	for _, s := range strings.Split(os.Getenv("LIMITLESS_REMOTE_"+kind), ",") {
-		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n == i {
-			return true
+	for _, group := range strings.Split(os.Getenv("LIMITLESS_REMOTE_"+kind), ";") {
+		worker, list := workers[0], group
+		if c := strings.IndexByte(group, ':'); c >= 0 {
+			worker, list = strings.TrimSpace(group[:c]), group[c+1:]
+		}
+		for _, s := range strings.Split(list, ",") {
+			if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n == i {
+				return worker
+			}
 		}
 	}
-	return false
+	return ""
 }
 
-// Separate concurrency caps for local vs remote proving. Both nodes are 64 GB and can
-// only prove ~1 segment at a time without swap-thrashing, so with JOBS>=2 (needed to
-// overlap local proving with a blocking remote dispatch) we must independently limit how
-// many segments prove locally vs remotely. LIMITLESS_LOCAL_CONCURRENCY caps local proves,
-// LIMITLESS_REMOTE_CONCURRENCY caps how many the worker proves at once. Unset => no cap
-// (the errgroup's JOBS limit alone applies, i.e. default single-node behavior unchanged).
+// Separate concurrency caps for local vs remote proving. The nodes can only prove ~1
+// segment at a time without swap-thrashing, so with JOBS>=2 (needed to overlap local
+// proving with a blocking remote dispatch) we must independently limit how many segments
+// prove locally vs remotely. LIMITLESS_LOCAL_CONCURRENCY caps local proves,
+// LIMITLESS_REMOTE_CONCURRENCY caps how many segments EACH worker proves at once (not the
+// total across workers). Unset => no cap (the errgroup's JOBS limit alone applies, i.e.
+// default single-node behavior unchanged).
 var localSem = makeSem("LIMITLESS_LOCAL_CONCURRENCY")
-var remoteSem = makeSem("LIMITLESS_REMOTE_CONCURRENCY")
+
+var (
+	remoteSemsOnce sync.Once
+	remoteSems     map[string]chan struct{}
+)
+
+// remoteSemFor returns the concurrency semaphore for the given worker (nil => no cap).
+func remoteSemFor(worker string) chan struct{} {
+	remoteSemsOnce.Do(func() {
+		remoteSems = make(map[string]chan struct{})
+		for _, w := range remoteWorkers() {
+			remoteSems[w] = makeSem("LIMITLESS_REMOTE_CONCURRENCY")
+		}
+	})
+	return remoteSems[worker]
+}
 
 func makeSem(env string) chan struct{} {
 	if v := os.Getenv(env); v != "" {
@@ -92,37 +134,38 @@ func release(s chan struct{}) {
 	}
 }
 
-// runGLDispatch proves GL segment i locally, or remotely if it is assigned to the worker.
+// runGLDispatch proves GL segment i locally, or remotely if it is assigned to a worker.
 func runGLDispatch(cfg *config.Config, i int, cache *circuitCache) (*distributed.SegmentProof, error) {
-	if isRemote("GL", i) {
-		acquire(remoteSem)
-		defer release(remoteSem)
-		return runSegmentRemote(cfg, "GL", i, nil)
+	if w := workerFor("GL", i); w != "" {
+		sem := remoteSemFor(w)
+		acquire(sem)
+		defer release(sem)
+		return runSegmentRemote(cfg, w, "GL", i, nil)
 	}
 	acquire(localSem)
 	defer release(localSem)
 	return RunGL(cfg, i, cache)
 }
 
-// runLPPDispatch proves LPP segment i locally, or remotely if assigned to the worker.
+// runLPPDispatch proves LPP segment i locally, or remotely if assigned to a worker.
 // sr is the shared randomness the coordinator derived from all GL proofs (the barrier).
 func runLPPDispatch(cfg *config.Config, i int, sr field.Octuplet) (*distributed.SegmentProof, error) {
-	if isRemote("LPP", i) {
-		acquire(remoteSem)
-		defer release(remoteSem)
-		return runSegmentRemote(cfg, "LPP", i, &sr)
+	if w := workerFor("LPP", i); w != "" {
+		sem := remoteSemFor(w)
+		acquire(sem)
+		defer release(sem)
+		return runSegmentRemote(cfg, w, "LPP", i, &sr)
 	}
 	acquire(localSem)
 	defer release(localSem)
 	return RunLPP(cfg, i, sr)
 }
 
-// runSegmentRemote ships witness-<kind>-<i> to the worker, runs prove-segment there, ships
-// the SegmentProof back, and deserializes it. sr is the shared-randomness octuplet (LPP
-// only; nil for GL). The returned proof is bit-identical to a locally-proved one, so it
-// flows into the shared-randomness barrier and conglomeration unchanged.
-func runSegmentRemote(cfg *config.Config, kind string, i int, sr *field.Octuplet) (*distributed.SegmentProof, error) {
-	worker := remoteWorker()
+// runSegmentRemote ships witness-<kind>-<i> to the given worker, runs prove-segment
+// there, ships the SegmentProof back, and deserializes it. sr is the shared-randomness
+// octuplet (LPP only; nil for GL). The returned proof is bit-identical to a locally-proved
+// one, so it flows into the shared-randomness barrier and conglomeration unchanged.
+func runSegmentRemote(cfg *config.Config, worker, kind string, i int, sr *field.Octuplet) (*distributed.SegmentProof, error) {
 	rdir := remoteDir()
 	localWitness := fmt.Sprintf("%s/witness-%s-%d", witnessDir, kind, i)
 	remoteWitness := fmt.Sprintf("%s/witness-%s-%d", rdir, kind, i)
