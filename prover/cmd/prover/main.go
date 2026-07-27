@@ -54,6 +54,15 @@ var (
 	}
 	verifyArgs cmd.VerifyArgs
 
+	// wrapCmd (POC) runs the final BLS12-377 PLONK wrap from a pre-wrap
+	// conglomeration proof emitted by `prove --stop-before-wrap`.
+	wrapCmd = &cobra.Command{
+		Use:   "wrap",
+		Short: "run the BLS12-377 wrap from a pre-wrap proof (emitted by prove --stop-before-wrap)",
+		RunE:  cmdWrap,
+	}
+	wrapArgs cmd.WrapArgs
+
 	// proveSegmentCmd (POC, multi-node worker) proves one limitless segment from a
 	// witness file shipped by the coordinator, writing the SegmentProof to ship back.
 	proveSegmentCmd = &cobra.Command{
@@ -99,6 +108,11 @@ func init() {
 	rootCmd.AddCommand(verifyCmd)
 	verifyCmd.Flags().StringVar(&verifyArgs.Proof, "proof", "", "path to the pre-wrap proof to verify")
 
+	rootCmd.AddCommand(wrapCmd)
+	wrapCmd.Flags().StringVar(&wrapArgs.Input, "in", "", "the original execution request file the pre-wrap proof was proved from")
+	wrapCmd.Flags().StringVar(&wrapArgs.Proof, "proof", "", "path to the emitted pre-wrap proof")
+	wrapCmd.Flags().StringVar(&wrapArgs.Output, "out", "", "output file for the execution response")
+
 	rootCmd.AddCommand(proveSegmentCmd)
 	proveSegmentCmd.Flags().StringVar(&proveSegmentArgs.Kind, "kind", "", "segment kind: GL or LPP")
 	proveSegmentCmd.Flags().StringVar(&proveSegmentArgs.Witness, "witness", "", "path to the module witness file (shipped by the coordinator)")
@@ -123,6 +137,11 @@ func cmdProve(*cobra.Command, []string) error {
 func cmdVerify(*cobra.Command, []string) error {
 	verifyArgs.ConfigFile = fConfigFile
 	return cmd.Verify(verifyArgs)
+}
+
+func cmdWrap(*cobra.Command, []string) error {
+	wrapArgs.ConfigFile = fConfigFile
+	return cmd.Wrap(wrapArgs)
 }
 
 func cmdProveSegment(*cobra.Command, []string) error {
