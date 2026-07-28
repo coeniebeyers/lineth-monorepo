@@ -431,13 +431,21 @@ func RunDistributedPipeline(cfg *config.Config, zkevmWitness *zkevm.Witness) (*P
 	if !cfg.Execution.StopBeforeWrap {
 		go func() {
 			logrus.Infof("Loading setup (background) - circuitID: %s", circuits.ExecutionLimitlessCircuitID)
+			tSetup := time.Now()
 			s, err := circuits.LoadSetup(cfg, circuits.ExecutionLimitlessCircuitID)
+			// Completion was otherwise consumed silently from the channel; this
+			// marks the end of the large setup load for resource attribution.
+			logrus.Infof("Setup load (background) done in %s", time.Since(tSetup))
 			setupCh <- setupResult{setup: s, err: err}
 		}()
 	}
 
 	// -- 4. Compute shared randomness FIRST (while proofGLs is still valid)
+	// This log line also marks the end of the GL phase for per-phase resource
+	// attribution (nothing else is logged after glErrGroup.Wait()).
+	tRandomness := time.Now()
 	sharedRandomness := distributed.GetSharedRandomnessFromSegmentProofs(proofGLs)
+	logrus.Infof("Computed shared randomness in %s (GL phase complete)", time.Since(tRandomness))
 
 	// Release proofGLs references — proofs were already sent to proofStream
 	// for conglomeration; this array is the only remaining reference from this goroutine.
